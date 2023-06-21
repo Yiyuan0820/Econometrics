@@ -1,0 +1,335 @@
+# ECMA 31210 PSet#3
+# 5/11/2023
+
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(xtable)
+library(ggplot2)
+library(optimx)
+library(optmin)
+
+FF <- read_csv("Desktop/UChicago/大四/Courses/2023Spring/ECMA 31210/PS/PSet #3/F-F_Research_Data_Factors.CSV", skip = 3)
+X25 <- read_csv("Desktop/UChicago/大四/Courses/2023Spring/ECMA 31210/PS/PSet #3/25_Portfolios_5x5.CSV", skip = 15)
+
+# For X25, only keep the monthly average value-weighted return
+X25 <- X25[1:1161,]
+
+# Keep January 1951 - March 2023. 
+FF <- subset(FF, ...1 >= 195101 & ...1 <= 202303)
+FF <- FF[1:867,] # Drop the annual average
+X25 <- subset(X25, ...1 >= 195101 & ...1 <= 202303)
+
+# (b) -------------------------------------------
+colnames(FF)[colnames(FF) == "Mkt-RF"] <- "Mkt_RF"
+mean(FF$Mkt_RF*12) %>% round(.,2)
+# [1] 7.62
+
+mean(FF$SMB*12) %>% round(.,2)
+# [1] 1.6
+
+mean(FF$HML*12) %>% round(.,2)
+# [1] 3.35
+
+# (c) -------------------------------------------
+X25 <- map(X25, as.numeric) # convert the dataframe into numeric
+
+# Prepare functions for calculations.
+multiply_by_12 <- function(x) {
+  y <- x * 12
+  return(y)
+}
+
+ER <- function(x) {
+  y <- x - FF$RF
+  return(y)
+}
+
+Table4a <- map(X25, ER) %>%
+  map(., mean) %>% 
+  map (., multiply_by_12) %>% 
+  map(., ~ round(.x, 2))
+
+# Convert the result into a more readable version.
+Table4a <- do.call(data.frame, Table4a)
+Table4a <- Table4a[, 2:26] # Drop ``...1''
+
+## Convert it from a list to a 6*6 matrix.
+Table4a <- Table4a %>%
+  pivot_longer(cols = everything(), names_to = "var_name") %>%
+  separate(var_name, c("A", "B"), sep = "\\.", remove = TRUE)
+Table4a <- pivot_wider(Table4a, names_from = A, values_from = value)
+
+## Combine the columns that represent the same thing.
+Table4a$ME1 <- coalesce(Table4a$SMALL, Table4a$ME1)
+Table4a$ME5 <- coalesce(Table4a$BIG, Table4a$ME5)
+Table4a <- Table4a[, !(names(Table4a) %in% c("SMALL", "BIG"))]
+
+## Combine the rows that represent the same thing.
+### Value
+Table4a[1, 3:5] <- Table4a[6, 3:5]
+Table4a[5, 3:5] <- Table4a[7, 3:5]
+
+### Name
+Table4a[1,1] <- Table4a[6,1]
+Table4a[5,1] <- Table4a[7,1]
+
+Table4a <- Table4a[1:5, ] # Drop the empty rows.
+
+Table4a$HML <- Table4a$ME5 - Table4a$ME1 # Calculate High-Low.
+
+# Calculate Small-Big
+SB <- c("SB")
+for (i in 1:5){
+  SB[i+1] <- Table4a[1, i+1] - Table4a[5, i+1]
+}
+SB[7] <- NA
+Table4a <- rbind(Table4a, unlist(SB))
+
+# Convert the table into the appropriate property.
+Table4a <- cbind(Table4a[1], map(Table4a[, 2:7], as.numeric))
+
+# Output the LaTex table.
+xtable_table4a <- xtable(Table4a)
+print(xtable_table4a, include.rownames = FALSE)
+
+# (d) -------------------------------------------
+X25 <- do.call(data.frame, X25)  
+X25 <- cbind(X25[ ,1], multiply_by_12(X25[2:26]))
+# Now X25 is in YEAR!
+
+# Update the annual version of ER function.
+ER12 <- function(x) {
+  y <- x - FF$RF * 12
+  return(y)
+}
+
+# The new dataframe TSReg includes the market excess return.
+TSReg <- map(X25[, 2:26], ER12) %>% 
+  do.call(data.frame, .) %>%
+  cbind(X25[1], .)
+
+# Prepare the variable names for loops.
+TSReg <- TSReg %>% 
+  rename_all(~ gsub("SMALL", "ME1", .)) %>% 
+  rename_all(~ gsub("LoBM", "BM1", .)) %>%
+  rename_all(~ gsub("BIG", "ME5", .)) %>% 
+  rename_all(~ gsub("HiBM", "BM5", .))
+colnames(TSReg)[2:26] <- paste0(colnames(TSReg)[2:26], "_ER")
+  
+# The first step (the "Fama-McBeth time-series regression")
+TSReg$Market <- FF$Mkt_RF * 12
+TSReg$SMB <- FF$SMB * 12
+TSReg$HML <- FF$HML*12
+
+HML <- c()
+SMB <- c()
+market <- c()
+
+for (i in 2:26) {
+  result <- lm(TSReg[, i] ~ Market + SMB + HML, data = TSReg)
+  market <- rbind(market, coef(result)[2])
+  SMB <- rbind(SMB, coef(result)[3])
+  HML <- rbind(HML, coef(result)[4])
+}
+
+beta <- cbind(market, SMB, HML) %>% data.frame()
+row.names(beta) <- paste0("ME", rep(1:5, 5), ".BM", rep(1:5, each = 5))
+
+# The second step (the "Fama-McBeth cross-section regression")
+beta$y <- map(TSReg[2:26], mean) %>% unlist(.) # the realized sample mean of ER
+second <- lm (y ~ Market + SMB + HML + 0, data = beta)
+round(second$coefficients,2)
+# Market  SMB    HML 
+# 7.25   1.31   3.96  
+
+# (g) -------------------------------------------
+# The moment function
+g_hat <- function(delta, r, f, lambda){
+  b <- delta[1:3]
+  mu <- delta[4:6]
+  
+  # N = asset, T = time, F = factors
+  R <- as.matrix(r) # T x N
+  Ft <- as.matrix(f) # T x F
+  n <- nrow(r)
+  
+  # g_hat
+  rbar <- colMeans(R) %>% as.matrix(.) # N X 1, the sample mean for each asset
+  M <- 1/n * t(R) %*% Ft # N x F
+  fbar <- colMeans(Ft) %>% as.matrix(.) # F x 1, the sample mean for each factor
+  
+  g_hat <- c((1 + t(mu) %*% b)[1,1] * rbar - M %*% b, t(fbar) - mu) %>%
+            as.matrix() # (N+F) x 1
+  
+  # S, W
+    # The initial value, delta^{(0)} from (e).
+    V_hat <- cov(f) # F x F
+    lambda_hat <- as.matrix(lambda) # F x 1
+    b_0 <- solve(V_hat) %*% lambda_hat   # F x 1
+    mu_0 <- c(mean(Ft[,1]), mean(Ft[,2]), mean(Ft[,3]))  # F x 1
+
+    mu_0_re <- replicate(n, mu_0, simplify = FALSE) %>%
+                      do.call(cbind,.)                   # F x T
+    b_0_re <- replicate(n, b_0, simplify = FALSE) %>%
+      do.call(cbind,.)                                   # F x T
+    
+    # results
+    g_01 <- matrix(NA, nrow = 25, ncol = 867)
+    for(i in 1:867){
+      g_01[,i] <- as.matrix(R[i,]) - as.matrix(R[i,]) %*% t((as.matrix(Ft[i,]) - as.matrix(mu_0))) %*% b_0
+    }
+    g_02 <- t(Ft) - mu_0_re
+    
+    g_0 <- rbind(g_01, g_02) %>%
+           as.matrix          # (N+F) x T
+    S <- 1/n * g_0 %*% t(g_0) # (N+F) x (N+F)
+    W <- solve(S, tol = .Machine$double.eps^10) # (N+F) x (N+F)
+    
+  return((t(g_hat) %*% W %*% g_hat)[1,1]) 
+}
+
+b_start <- c(0.00324, 0.000895, 0.00416)
+mu_start <- c(7.25, 1.31, 3.96)
+
+# The GMM estimator.
+GMM_ests <- optimx(c(b_start, mu_start), g_hat, 
+                   r = TSReg[, 2:26] , f = TSReg[, 27:29], lambda = second$coefficients)
+
+g_hat(c(b_start, mu_start), 
+      r = TSReg[, 2:26], f = TSReg[, 27:29], lambda = second$coefficients)
+
+# J statistics
+jstats <- 867 * g_hat(delta = c(0.00324, 0.000895, 0.00416, 7.62, 1.70, 3.52), 
+            r = TSReg[, 2:26], f = TSReg[, 27:29], lambda = second$coefficients)
+
+# [1] 83.35418
+
+# dof: K - L = (N+F) - (F+F) = N - F = 25 - 3 = 22
+
+# (h) -------------------------------------------
+g_jacobian <- function(delta, r, f){
+  b <- delta[1:3]
+  mu <- delta[4:6]
+  
+  # N = asset, T = time, F = factors
+  R <- as.matrix(r) # T x N
+  Ft <- as.matrix(f) # T x F
+  n <- nrow(r)
+  
+  # g_hat
+  rbar <- colMeans(R) %>% as.matrix(.) # N X 1, the sample mean for each asset
+  M <- 1/n * t(R) %*% Ft # N x F
+  
+  a <- rbar %*% t(mu) - M  # N x F
+  beta <- rbar %*% t(b) # N x F
+  c <- matrix(0, nrow = ncol(Ft), ncol = ncol(Ft)) # F x F
+  d <- -diag(1, nrow = ncol(Ft), ncol = ncol(Ft)) # F x F
+  
+  matrix1 <- cbind(a,beta)
+  matrix2 <- cbind(c,d)
+  jacobian <- rbind(matrix1, matrix2)
+  
+  return(jacobian)
+}
+
+G <- g_jacobian(delta = c(0.00324, 0.000895, 0.00416, 7.62, 1.70, 3.52), 
+                       r = TSReg[, 2:26], f = TSReg[, 27:29])
+
+W <- function(delta, r, f, lambda){
+  b <- delta[1:3]
+  mu <- delta[4:6]
+  
+  # N = asset, T = time, F = factors
+  R <- as.matrix(r) # T x N
+  Ft <- as.matrix(f) # T x F
+  n <- nrow(r)
+  
+  # g_hat
+  rbar <- colMeans(R) %>% as.matrix(.) # N X 1, the sample mean for each asset
+  M <- 1/n * t(R) %*% Ft # N x F
+  fbar <- colMeans(Ft) %>% as.matrix(.) # F x 1, the sample mean for each factor
+  
+  g_hat <- c((1 + t(mu) %*% b)[1,1] * rbar - M %*% b, t(fbar) - mu) %>%
+    as.matrix() # (N+F) x 1
+  
+  V_hat <- cov(f) # F x F
+  lambda_hat <- as.matrix(lambda) # F x 1
+  b_0 <- solve(V_hat) %*% lambda_hat    # F x 1
+  mu_0 <- c(mean(Ft[,1]), mean(Ft[,2]), mean(Ft[,3]))  # F x 1
+  
+  mu_0_re <- replicate(n, mu_0, simplify = FALSE) %>%
+    do.call(cbind,.)                   # F x T
+  b_0_re <- replicate(n, b_0, simplify = FALSE) %>%
+    do.call(cbind,.)                                   # F x T
+  
+  # results
+  g_01 <- matrix(NA, nrow = 25, ncol = 867)
+  for(i in 1:867){
+    g_01[,i] <- as.matrix(R[i,]) - as.matrix(R[i,]) %*% t((as.matrix(Ft[i,]) - as.matrix(mu_0))) %*% b_0
+  }
+  g_02 <- t(Ft) - mu_0_re
+  
+  g_0 <- rbind(g_01, g_02) %>%
+    as.matrix          # (N+F) x T
+  S <- 1/n * g_0 %*% t(g_0) # (N+F) x (N+F)
+  W <- solve(S, tol = .Machine$double.eps^10) # (N+F) x (N+F)
+  
+  return(W)
+}
+
+W_est <- W(delta = c(0.00324, 0.000895, 0.00416, 7.62, 1.70, 3.52), 
+           r = TSReg[, 2:26], f = TSReg[, 27:29], lambda = second$coefficients)
+
+Avar <- t(G) %*% W_est %*% G %>% solve(.)
+
+# The standard Error
+SE <- sqrt(diag(Avar/867))
+round(SE,4)
+# [1] 0.0008  0.0011  0.0011  1.7680  1.1615  1.1463
+
+# t value
+t_value <- c()
+
+beta_gmm <- c(0.00324, 0.000895, 0.00416)
+for (i in 1:3){
+  t_value[i] <- (beta_gmm[i] - 0)/SE[i]
+}
+
+mu_gmm <- c(7.62, 1.70, 3.52)
+for(i in 4:6){
+  t_value[i] <- (mu_gmm[i-3] - mean(TSReg[ , i+23]))/SE[i]
+}
+round(t_value,2)
+
+for(i in 4:6){
+  t_value[i] <- (mu_gmm[i-3] - 0)/SE[i]
+}
+round(t_value,2)
+
+# [1] 4.27  0.85  3.75  4.31  1.46  3.07
+
+
+# (j) -------------------------------------------
+fitted <- second$fitted.values
+beta <- cbind(beta, fitted)
+
+# Small growth
+beta["ME1.BM1", 4:5]
+#               y   fitted
+# ME1.BM1 3.842704 8.981724
+
+# Small Value
+beta["ME1.BM5", 4:5]
+#                y   fitted
+# ME1.BM5 7.676549 5.560508
+
+circle <- rbind(beta["ME1.BM1", 4:5], beta["ME5.BM1", 4:5]) %>% do.call(data.frame,.)
+
+# Plot by OLS
+ggplot(data = beta, aes(x = fitted, y = y)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_point(data = circle, shape = 1, size = 10) +
+  labs(x = "Predicted Risk Premium", y = "Actual Risk Premium") +
+  xlim(0, 15) + ylim(0,15)
